@@ -36,7 +36,10 @@ const speak = (text, langCode) => {
     'es': 'es-ES', 'fr': 'fr-FR', 'de': 'de-DE', 'zh': 'zh-CN'
   };
   
-  const utterance = new SpeechSynthesisUtterance(text);
+  // Clean up formatting markdown for speech
+  const cleanText = text.replace(/\*\*\*/g, '').replace(/\*\*/g, '').replace(/\*/g, '');
+  
+  const utterance = new SpeechSynthesisUtterance(cleanText);
   utterance.lang = langMap[langCode] || 'en-US';
   utterance.rate = 0.9;
   window.speechSynthesis.speak(utterance);
@@ -62,6 +65,7 @@ const getPdfInfo = async (file) => {
   return { pdf, numPages: pdf.numPages };
 };
 
+// Ekstraksi canggih untuk mempertahankan baris, paragraf, dan styling (bold/italic)
 const extractTextFromPDFRange = async (pdf, start, end) => {
   let fullText = '';
   const startIdx = Math.max(1, start);
@@ -70,10 +74,77 @@ const extractTextFromPDFRange = async (pdf, start, end) => {
   for (let i = startIdx; i <= endIdx; i++) {
     const page = await pdf.getPage(i);
     const textContent = await page.getTextContent();
-    const pageText = textContent.items.map(item => item.str).join(' ');
+    
+    // 1. Ekstrak properti posisi dan font
+    const items = textContent.items.map(item => {
+      const fontName = item.fontName ? item.fontName.toLowerCase() : '';
+      const isBold = fontName.includes('bold');
+      const isItalic = fontName.includes('italic') || fontName.includes('oblique');
+      
+      let text = item.str;
+      if (text.trim() !== '') {
+        if (isBold && isItalic) text = `***${text}***`;
+        else if (isBold) text = `**${text}**`;
+        else if (isItalic) text = `*${text}*`;
+      }
+      
+      return {
+        str: text,
+        origStr: item.str,
+        x: item.transform[4],
+        y: item.transform[5],
+        height: item.height || item.transform[3]
+      };
+    });
+
+    // 2. Urutkan berdasarkan koordinat Y (atas ke bawah), lalu X (kiri ke kanan)
+    items.sort((a, b) => {
+      if (Math.abs(a.y - b.y) < (a.height * 0.5)) return a.x - b.x;
+      return b.y - a.y; // PDF Y menurun
+    });
+
+    // 3. Gabungkan kembali dengan logika jarak (spasi/enter)
+    let pageText = '';
+    let lastY = null;
+    let lastX = null;
+
+    for (const item of items) {
+      if (item.origStr.trim() === '' && item.origStr !== ' ') continue;
+
+      if (lastY !== null && Math.abs(lastY - item.y) > (item.height * 0.5)) {
+        // Beda sumbu Y berarti baris baru. Cek seberapa jauh untuk enter ganda (paragraf)
+        if (Math.abs(lastY - item.y) > item.height * 1.5) {
+          pageText += '\n\n';
+        } else {
+          pageText += '\n';
+        }
+      } else if (lastY !== null && lastX !== null) {
+        // Di baris yang sama, cek jarak horizontal untuk menambah spasi jika perlu
+        if (item.x - lastX > (item.height * 0.2) && !pageText.endsWith(' ') && !pageText.endsWith('\n')) {
+          pageText += ' ';
+        }
+      }
+      
+      pageText += item.str;
+      lastY = item.y;
+      lastX = item.x + (item.origStr.length * (item.height * 0.4)); // Perkiraan akhir X kata saat ini
+    }
+    
     fullText += pageText + '\n\n';
   }
   return fullText;
+};
+
+// Helper untuk merender Markdown ringan (**bold**, *italic*) secara aman di React UI
+const renderFormattedText = (text) => {
+  if (!text) return null;
+  const parts = text.split(/(\*\*\*.*?\*\*\*|\*\*.*?\*\*|\*.*?\*)/g);
+  return parts.map((part, i) => {
+    if (part.startsWith('***') && part.endsWith('***')) return <strong key={i} className="font-bold italic">{part.slice(3, -3)}</strong>;
+    if (part.startsWith('**') && part.endsWith('**')) return <strong key={i} className="font-bold">{part.slice(2, -2)}</strong>;
+    if (part.startsWith('*') && part.endsWith('*')) return <em key={i} className="italic">{part.slice(1, -1)}</em>;
+    return <span key={i}>{part}</span>;
+  });
 };
 
 // --- API CALL FUNCTION (KONEKSI KE BACKEND LOKAL) ---
@@ -179,7 +250,8 @@ export default function App() {
 
   const handleCopy = () => {
     if (result?.translation) {
-      navigator.clipboard.writeText(result.translation);
+      const cleanText = result.translation.replace(/\*\*\*/g, '').replace(/\*\*/g, '').replace(/\*/g, '');
+      navigator.clipboard.writeText(cleanText);
       setCopied(true);
       setTimeout(() => setCopied(false), 2000);
     }
@@ -309,7 +381,7 @@ export default function App() {
                 <button onClick={handleCopy} className="p-2 rounded-lg text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors" title="Salin">
                   {copied ? <Check size={18} className="text-green-500" /> : <Copy size={18} />}
                 </button>
-                <button onClick={() => setFullscreenData({ title: 'Hasil Terjemahan', text: result.translation, phonetic: result.phonetic, targetLang, originalLang: sourceLang === 'auto' ? result.detectedLanguage || 'Deteksi Otomatis' : LANGUAGES.find(l => l.code === sourceLang)?.name || 'Bahasa Asli' })} className="p-2 rounded-lg text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors" title="Baca Layar Penuh">
+                <button onClick={() => setFullscreenData({ title: 'Hasil Terjemahan', text: result.translation, phonetic: result.phonetic, targetLang })} className="p-2 rounded-lg text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors" title="Baca Layar Penuh">
                   <Maximize size={18} />
                 </button>
               </div>
@@ -340,11 +412,8 @@ export default function App() {
                 
                 <div className="overflow-y-auto max-h-[300px] pr-2">
                   <div className={`text-gray-800 dark:text-white mb-2 whitespace-pre-wrap ${textSize} ${fontStyle}`}>
-                    {result.translation}
+                    {renderFormattedText(result.translation)}
                   </div>
-                  <p className="text-sm text-gray-500 dark:text-gray-400 mt-3">
-                    Bahasa asli: {sourceLang === 'auto' ? result.detectedLanguage || 'Deteksi Otomatis' : LANGUAGES.find(l => l.code === sourceLang)?.name || 'Bahasa Asli'}
-                  </p>
                   {result.phonetic && (
                     <p className="text-gray-500 dark:text-gray-400 font-mono text-sm mt-2">
                       /{result.phonetic}/
@@ -492,7 +561,7 @@ export default function App() {
                 ? 'bg-indigo-600 text-white rounded-br-none' 
                 : 'bg-white dark:bg-gray-800 text-gray-800 dark:text-gray-100 rounded-bl-none border border-gray-100 dark:border-gray-700'
               }`}>
-                <p className={`${textSize} ${fontStyle}`}>{msg.text}</p>
+                <div className={`${textSize} ${fontStyle}`}>{renderFormattedText(msg.text)}</div>
                 {msg.sender === 'bot' && msg.phonetic && (
                   <p className="text-xs text-gray-500 dark:text-gray-400 mt-1 font-sans">/{msg.phonetic}/</p>
                 )}
@@ -544,8 +613,8 @@ export default function App() {
               <span>{item.timestamp}</span>
             </div>
             <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
-               <p className={`text-gray-600 dark:text-gray-300 ${fontStyle}`}>{item.original}</p>
-               <p className={`font-medium text-gray-800 dark:text-white ${fontStyle}`}>{item.translation}</p>
+               <div className={`text-gray-600 dark:text-gray-300 ${fontStyle}`}>{renderFormattedText(item.original)}</div>
+               <div className={`font-medium text-gray-800 dark:text-white ${fontStyle}`}>{renderFormattedText(item.translation)}</div>
             </div>
           </div>
         ))
@@ -629,59 +698,20 @@ export default function App() {
       }
     };
 
-    const renderFormattedDocumentText = (text) => {
-      return text.split('\n').map((line, index) => {
-        const trimmed = line.trim();
-        if (!trimmed) return <div key={index} className="mb-4 min-h-[1rem]" />;
-
-        const tocMatch = trimmed.match(/^(.*\S)\s+(\d+)$/);
-        if (tocMatch && tocMatch[1].length > 20) {
-          return (
-            <div key={index} className="flex items-center gap-3 mb-4 leading-relaxed">
-              <span className="flex-shrink-0 whitespace-nowrap">{tocMatch[1]}</span>
-              <span className="flex-1 border-b border-dotted border-gray-300 dark:border-gray-600" />
-              <span className="flex-shrink-0 whitespace-nowrap">{tocMatch[2]}</span>
-            </div>
-          );
-        }
-
-        return (
-          <p key={index} className="mb-4 text-justify leading-relaxed">
-            {trimmed}
-          </p>
-        );
-      });
-    };
-
     const handleDownloadPDF = async () => {
       try {
         await loadExternalScript('https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js');
         
-        const escapeHtml = (text) => text.replace(/</g, "&lt;").replace(/>/g, "&gt;");
-        const formatContentLine = (line) => {
-          const trimmed = line.trim();
-          if (!trimmed) return '<div style="margin-bottom: 16px; min-height: 1rem;"></div>';
+        // Memformat teks menjadi HTML dengan mempertahankan baris, spasi ganda untuk paragraf, dan markdown tebal/miring
+        const formattedHtml = translatedText
+          .replace(/</g, "&lt;").replace(/>/g, "&gt;")
+          .replace(/\*\*\*(.*?)\*\*\*/g, '<strong><em>$1</em></strong>')
+          .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+          .replace(/\*(.*?)\*/g, '<em>$1</em>')
+          .replace(/\n\n/g, '</p><p style="margin-bottom: 16px; text-align: justify; line-height: 1.8;">')
+          .replace(/\n/g, '<br/>');
 
-          const tocMatch = trimmed.match(/^(.*\S)\s+(\d+)$/);
-          if (tocMatch && tocMatch[1].length > 20) {
-            const left = escapeHtml(tocMatch[1]);
-            const right = escapeHtml(tocMatch[2]);
-            return `
-              <div style="display: flex; align-items: center; gap: 0.75rem; margin-bottom: 16px; line-height: 1.8;">
-                <span style="flex-shrink: 0; white-space: nowrap;">${left}</span>
-                <span style="flex: 1; border-bottom: 1px dotted #9ca3af; min-width: 0;"></span>
-                <span style="flex-shrink: 0; white-space: nowrap;">${right}</span>
-              </div>
-            `;
-          }
-
-          return `<p style="margin-bottom: 16px; text-align: justify; line-height: 1.8;">${escapeHtml(trimmed)}</p>`;
-        };
-
-        const paragraphs = translatedText
-          .split('\n')
-          .map(formatContentLine)
-          .join('');
+        const htmlContent = `<p style="margin-bottom: 16px; text-align: justify; line-height: 1.8;">${formattedHtml}</p>`;
 
         const tempDiv = document.createElement('div');
         tempDiv.innerHTML = `
@@ -689,7 +719,7 @@ export default function App() {
             <h2 style="color: #4f46e5; border-bottom: 2px solid #e5e7eb; padding-bottom: 12px; margin-bottom: 24px; font-size: 22px; font-family: sans-serif;">
               Terjemahan: ${file?.name || 'Dokumen'}
             </h2>
-            <div style="font-size: 13pt;">${paragraphs}</div>
+            <div style="font-size: 13pt;">${htmlContent}</div>
             <div style="margin-top: 40px; border-top: 1px solid #e5e7eb; padding-top: 10px; font-size: 9pt; color: #6b7280; text-align: right; font-family: sans-serif;">
               Diterjemahkan secara otomatis oleh LingoAI Translator
             </div>
@@ -821,7 +851,9 @@ export default function App() {
                   <div className="flex flex-col items-center justify-center h-full gap-3 text-indigo-500 font-sans text-base">
                      <Loader2 className="animate-spin" size={32} /> Mengekstrak teks...
                   </div>
-                ) : originalText || (
+                ) : originalText ? (
+                  renderFormattedText(originalText)
+                ) : (
                   <div className="flex items-center justify-center h-full text-gray-400 italic text-center font-sans text-base">
                     Teks asli dari dokumen Anda akan muncul di sini...
                   </div>
@@ -844,19 +876,19 @@ export default function App() {
                    <Download size={16} /> Unduh PDF
                  </button>
                  {translatedText && (
-                   <button onClick={() => setFullscreenData({ title: `Terjemahan: ${file?.name || 'Dokumen'}`, text: translatedText, targetLang, originalLang: sourceLang === 'auto' ? 'Deteksi Otomatis' : LANGUAGES.find(l => l.code === sourceLang)?.name || 'Bahasa Asli' })} className="p-2 rounded-lg text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors bg-white dark:bg-gray-800 shadow-sm border border-gray-200 dark:border-gray-700" title="Baca Layar Penuh">
+                   <button onClick={() => setFullscreenData({ title: `Terjemahan: ${file?.name || 'Dokumen'}`, text: translatedText, targetLang })} className="p-2 rounded-lg text-gray-500 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors bg-white dark:bg-gray-800 shadow-sm border border-gray-200 dark:border-gray-700" title="Baca Layar Penuh">
                      <Maximize size={16} />
                    </button>
                  )}
                </div>
              </div>
-             <div className={`p-6 flex-1 overflow-y-auto text-gray-800 dark:text-gray-100 leading-relaxed ${textSize} ${fontStyle}`}>
+             <div className={`p-6 flex-1 overflow-y-auto whitespace-pre-wrap text-gray-800 dark:text-gray-100 leading-relaxed ${textSize} ${fontStyle}`}>
                 {docStatus === 'translating' ? (
                   <div className="flex flex-col items-center justify-center h-full gap-3 text-indigo-500 font-sans text-base">
                      <Loader2 className="animate-spin" size={32} /> Menerjemahkan dokumen...
                   </div>
                 ) : translatedText ? (
-                  renderFormattedDocumentText(translatedText)
+                  renderFormattedText(translatedText)
                 ) : (
                   <div className="flex items-center justify-center h-full text-gray-400 italic text-center font-sans text-base">
                     Hasil terjemahan akan muncul di sini...
@@ -971,7 +1003,8 @@ export default function App() {
                 <Volume2 size={20} />
               </button>
               <button onClick={() => {
-                navigator.clipboard.writeText(fullscreenData.text);
+                const cleanText = fullscreenData.text.replace(/\*\*\*/g, '').replace(/\*\*/g, '').replace(/\*/g, '');
+                navigator.clipboard.writeText(cleanText);
                 setCopied(true);
                 setTimeout(() => setCopied(false), 2000);
               }} className="p-3 rounded-xl text-gray-500 hover:bg-gray-200 dark:hover:bg-gray-700 transition-colors" title="Salin">
@@ -986,7 +1019,7 @@ export default function App() {
           <div className="flex-1 overflow-y-auto p-6 md:p-12 lg:px-24">
             <div className="max-w-4xl mx-auto pb-12">
               <div className={`text-gray-800 dark:text-gray-100 whitespace-pre-wrap leading-loose md:leading-loose text-justify ${fontStyle} ${textSize}`}>
-                {fullscreenData.text}
+                {renderFormattedText(fullscreenData.text)}
               </div>
               {fullscreenData.phonetic && (
                 <p className="text-gray-500 dark:text-gray-400 font-mono text-lg mt-12 border-t border-gray-100 dark:border-gray-800 pt-8 text-center">
