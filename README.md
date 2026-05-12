@@ -1,0 +1,1 @@
+# lingoai-frontend
